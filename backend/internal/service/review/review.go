@@ -68,6 +68,7 @@ type Manager interface {
 	RequestRereview(ctx context.Context, workerID domain.SessionID, prURL, reviewer string) error
 	ResolveReviewComment(ctx context.Context, workerID domain.SessionID, prURL, commentURL string) error
 	TriggerAuto(ctx context.Context, workerID domain.SessionID, harness domain.ReviewerHarness) (reviewcore.TriggerResult, error)
+	AdvanceCycles(ctx context.Context, workerID domain.SessionID) (reviewcore.TriggerResult, error)
 	Cancel(ctx context.Context, workerID domain.SessionID) (reviewcore.CancelResult, error)
 	TerminateReviewer(ctx context.Context, workerID domain.SessionID, body string) error
 	ArchiveReviewer(ctx context.Context, workerID domain.SessionID) error
@@ -96,6 +97,46 @@ type Service struct {
 	// instrumented path can be exercised without standing up a full engine and
 	// its eighteen-method store. Defaulted in New; only tests replace it.
 	engineTrigger func(context.Context, domain.SessionID, reviewcore.TriggerOptions) (reviewcore.TriggerResult, error)
+	// engineAdvance indirects the engine's review-cycle queue step for the
+	// same reason. Defaulted in New; only tests replace it.
+	engineAdvance func(context.Context, domain.SessionID) (reviewcore.TriggerResult, error)
+	// afterSubmit runs the queue step that follows a submitted result. The
+	// next reviewer reuses the worker's reviewer terminal, so launching it
+	// inside the submit request would kill the submitting reviewer before its
+	// `ao review submit` hears back. Defaults to a goroutine that waits
+	// submitAdvanceDelay; tests run it inline. The auto-review sweep advances
+	// the queue if this step is dropped.
+	afterSubmit func(func())
+	// background is the daemon's lifetime context. The deferred queue step
+	// runs under it, so shutdown cancels a step that has not launched yet.
+	background context.Context
+}
+
+// submitAdvanceDelay is how long the queue step after a submit waits, so the
+// submitting reviewer's `ao review submit` has its response before the next
+// reviewer takes over the worker's reviewer terminal.
+const submitAdvanceDelay = 2 * time.Second
+
+// WithBackgroundContext ties deferred review work to the daemon's lifetime.
+func WithBackgroundContext(ctx context.Context) Option {
+	return func(s *Service) { s.background = ctx }
+}
+
+// runAfterDelay runs f after delay unless ctx ends first.
+func runAfterDelay(ctx context.Context, delay time.Duration, f func()) {
+	if ctx.Err() != nil {
+		return
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	if ctx.Err() == nil {
+		f()
+	}
 }
 
 type reviewNotificationSink interface {
@@ -232,7 +273,28 @@ func New(engine *reviewcore.Engine, store Store, opts ...Option) *Service {
 			return s.engine.TriggerWithOptions(ctx, workerID, opts)
 		}
 	}
+	if s.background == nil {
+		s.background = context.Background()
+	}
+	if s.afterSubmit == nil {
+		s.afterSubmit = func(f func()) { go runAfterDelay(s.background, submitAdvanceDelay, f) }
+	}
+	if s.engineAdvance == nil {
+		s.engineAdvance = func(ctx context.Context, workerID domain.SessionID) (reviewcore.TriggerResult, error) {
+			if s.engine == nil {
+				return reviewcore.TriggerResult{}, nil
+			}
+			return s.engine.AdvanceCycles(ctx, workerID)
+		}
+	}
 	return s
+}
+
+// AdvanceCycles runs the worker's review-cycle queue step: when no reviewer
+// is running, it launches the next reviewer an open cycle still owes. It is
+// idempotent, so the auto-review sweep may call it on every pass.
+func (s *Service) AdvanceCycles(ctx context.Context, workerID domain.SessionID) (reviewcore.TriggerResult, error) {
+	return s.engineAdvance(ctx, workerID)
 }
 
 // RequestRereview asks the SCM provider to request another review from reviewer
@@ -823,6 +885,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q does not belong to worker %q", ErrInvalid, runID, workerID)
 	}
 
+	transitioned := false
 	switch run.Status {
 	case domain.ReviewRunRunning:
 		session, found, err := s.store.GetSession(ctx, workerID)
@@ -844,6 +907,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		run.Body = body
 		run.GithubReviewID = githubReviewID
 		run.AutoInjectReview = session.AutoInjectReview
+		transitioned = true
 		if githubReviewID != "" && s.reviewRefresher != nil {
 			s.reviewRefresher.RequestReviewRefresh(run.PRURL)
 		}
@@ -883,7 +947,24 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", errRunSuperseded, runID)
 	}
 	s.emitReviewNotification(ctx, run)
+	if transitioned {
+		s.advanceAfterSubmit(workerID)
+	}
 	return run, nil
+}
+
+// advanceAfterSubmit starts the next reviewer the worker's review cycles owe
+// now that this one has reported. The result is already recorded, so a queue
+// failure is logged rather than failing the submission; the auto-review sweep
+// retries the step. The step outlives the request: launching the next
+// reviewer may release the submitting reviewer's pane, which ends its call.
+func (s *Service) advanceAfterSubmit(workerID domain.SessionID) {
+	ctx := s.background
+	s.afterSubmit(func() {
+		if _, err := s.engineAdvance(ctx, workerID); err != nil && ctx.Err() == nil {
+			slog.Default().WarnContext(ctx, "review submit: advance review cycles failed", "session", workerID, "err", err)
+		}
+	})
 }
 
 func (s *Service) emitReviewNotification(ctx context.Context, run domain.ReviewRun) {

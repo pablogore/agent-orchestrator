@@ -159,6 +159,24 @@ func (c ProjectConfig) DefaultWorkerReviewer() (ReviewerHarness, AgentConfig) {
 	return harness, config
 }
 
+// ExpectedReviewers lists, in order, the reviewers that must each approve a
+// worker's PR head. A session's own reviewer replaces the project's set;
+// otherwise every configured project reviewer is expected. With none
+// configured, the single fallback reviewer of DefaultWorkerReviewer or
+// ResolveReviewerHarness is expected.
+func (c ProjectConfig) ExpectedReviewers(session SessionRecord) []ReviewerConfig {
+	if session.ReviewerHarness != "" {
+		return []ReviewerConfig{{Harness: session.ReviewerHarness, AgentConfig: session.ReviewerConfig}}
+	}
+	if len(c.Reviewers) > 0 {
+		return append([]ReviewerConfig(nil), c.Reviewers...)
+	}
+	if harness, config := c.DefaultWorkerReviewer(); harness != "" {
+		return []ReviewerConfig{{Harness: harness, AgentConfig: config}}
+	}
+	return []ReviewerConfig{{Harness: c.ResolveReviewerHarness(session.Harness)}}
+}
+
 // RoleOverride overrides the harness and/or agent config for a session role.
 type RoleOverride struct {
 	Harness     AgentHarness `json:"agent,omitempty"`
@@ -261,10 +279,17 @@ func (c ProjectConfig) Validate() error {
 	if err := validateRepoRelative(c.AgentRulesFile); err != nil {
 		return fmt.Errorf("agentRulesFile %q: %w", c.AgentRulesFile, err)
 	}
+	seenReviewers := make(map[ReviewerHarness]bool, len(c.Reviewers))
 	for i, rv := range c.Reviewers {
 		if !rv.Harness.IsKnown() {
 			return fmt.Errorf("reviewers[%d].harness: unknown harness %q", i, rv.Harness)
 		}
+		// A reviewer is identified by its harness, so listing one twice would
+		// expect two approvals that can only ever come from one reviewer.
+		if seenReviewers[rv.Harness] {
+			return fmt.Errorf("reviewers[%d].harness: %q is already listed", i, rv.Harness)
+		}
+		seenReviewers[rv.Harness] = true
 		if err := rv.AgentConfig.Validate(); err != nil {
 			return fmt.Errorf("reviewers[%d].agentConfig: %w", i, err)
 		}

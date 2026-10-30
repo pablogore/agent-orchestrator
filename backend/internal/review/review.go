@@ -12,6 +12,7 @@ import (
 	stdctx "context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,14 @@ type Store interface {
 	ListRunningReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
 	ListRecoverableChatReviews(ctx stdctx.Context) ([]domain.Review, error)
 	RecordReviewChatControllerError(ctx stdctx.Context, id, message string, now time.Time) (bool, error)
+	// Review cycles (#5465): one open cycle per worker and PR head snapshots
+	// the reviewers that head owes. InsertReviewCycle returns
+	// domain.ErrDuplicateReviewCycle when the worker already has an open cycle
+	// for the PR; ListOpenReviewCyclesBySession orders members by Position.
+	InsertReviewCycle(ctx stdctx.Context, c domain.ReviewCycle) error
+	ListOpenReviewCyclesBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewCycle, error)
+	SupersedeReviewCycle(ctx stdctx.Context, id, reason string, at time.Time) (bool, error)
+	SetReviewCycleMemberQueued(ctx stdctx.Context, cycleID string, harness domain.ReviewerHarness, at time.Time, source domain.ReviewTriggerSource) (bool, error)
 }
 
 // Sessions resolves the worker session under review.
@@ -264,6 +273,14 @@ type TriggerOptions struct {
 	// The same reviewer is never started twice on one head at the same time:
 	// a person's rerun reuses that running pass, an agent's rerun is told so.
 	Rerun bool
+
+	// notBefore is the earliest start a new pass may record: a review-cycle
+	// launch passes the member's queueing time, so a wall clock that stepped
+	// back cannot date the pass before the queueing it answers.
+	notBefore time.Time
+	// cycleScope, set for an automatic retry by name, limits the pass to the
+	// heads whose open review cycle lists the reviewer (or that have none).
+	cycleScope bool
 }
 
 // TriggerWithOptions starts reviews for every PR on the worker session that needs review.
@@ -329,15 +346,65 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	if worker.Metadata.WorkspacePath == "" {
 		return TriggerResult{}, fmt.Errorf("%w: worker session %q has no workspace to review", ErrInvalid, workerID)
 	}
+	if err := overrideConfig.Validate(); err != nil {
+		return TriggerResult{}, fmt.Errorf("%w: reviewer config: %w", ErrInvalid, err)
+	}
+	opts.Source = source
+	if override == "" && overrideConfig.IsZero() {
+		// No reviewer named: the head owes every expected reviewer, so the
+		// trigger opens (or re-queues) review cycles and the queue picks who
+		// runs now (#5465). A config-only override still targets the session's
+		// own reviewer, as a second opinion with that config.
+		return e.triggerCyclesLocked(ctx, workerID, worker, opts)
+	}
+	if source == domain.ReviewTriggerAuto {
+		// An automatic retry names its reviewer from facts read before this
+		// lock. Reviewers run one at a time per worker and share its reviewer
+		// terminal, so it must not start while another reviewer works.
+		busy, err := e.otherReviewerRunning(ctx, workerID, worker, override)
+		if err != nil {
+			return TriggerResult{}, err
+		}
+		if busy {
+			return TriggerResult{SkipReason: "review_running"}, nil
+		}
+		opts.cycleScope = true
+	}
+	return e.triggerHarnessLocked(ctx, workerID, worker, opts, nil)
+}
 
+// otherReviewerRunning reports a pass of a reviewer other than harness running
+// on one of the worker's current PR heads, after failing the passes of
+// reviewers whose pane is gone.
+func (e *Engine) otherReviewerRunning(ctx stdctx.Context, workerID domain.SessionID, worker domain.SessionRecord, harness domain.ReviewerHarness) (bool, error) {
+	runs, err := e.reconciledRuns(ctx, workerID, worker, false)
+	if err != nil {
+		return false, err
+	}
 	prs, err := e.prs.ListPRsBySession(ctx, workerID)
 	if err != nil {
-		return TriggerResult{}, err
+		return false, err
+	}
+	var others []domain.ReviewRun
+	for _, run := range runs {
+		if run.Harness != harness && run.Harness != "" {
+			others = append(others, run)
+		}
+	}
+	return reviewerRunningOnCurrentHead(others, prs), nil
+}
+
+// triggerTargetPRs lists the worker's PRs, narrowed to the one named PR when
+// the caller asked for it.
+func (e *Engine) triggerTargetPRs(ctx stdctx.Context, workerID domain.SessionID, prURL string) ([]domain.PullRequest, error) {
+	prs, err := e.prs.ListPRsBySession(ctx, workerID)
+	if err != nil {
+		return nil, err
 	}
 	if len(prs) == 0 {
-		return TriggerResult{}, fmt.Errorf("%w: AO is not tracking a PR for worker %q yet; if you just opened one, run `ao review trigger --pr <url>`", ErrInvalid, workerID)
+		return nil, fmt.Errorf("%w: AO is not tracking a PR for worker %q yet; if you just opened one, run `ao review trigger --pr <url>`", ErrInvalid, workerID)
 	}
-	if want := strings.TrimSpace(opts.PRURL); want != "" {
+	if want := strings.TrimSpace(prURL); want != "" {
 		// A targeted pass reviews only the named PR, matched by API or web URL.
 		var only []domain.PullRequest
 		for _, pr := range prs {
@@ -346,17 +413,60 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 			}
 		}
 		if len(only) == 0 {
-			return TriggerResult{}, fmt.Errorf("%w: pull request %s is not tracked for worker %q", ErrNotFound, want, workerID)
+			return nil, fmt.Errorf("%w: pull request %s is not tracked for worker %q", ErrNotFound, want, workerID)
 		}
 		prs = only
+	}
+	return prs, nil
+}
+
+// triggerHarnessLocked runs one reviewer harness over the worker's PR heads.
+// The caller holds the worker lock and has validated opts. onlyPRs, when set,
+// restricts the pass to those PR URLs (the heads a review cycle owes it).
+func (e *Engine) triggerHarnessLocked(ctx stdctx.Context, workerID domain.SessionID, worker domain.SessionRecord, opts TriggerOptions, onlyPRs map[string]bool) (TriggerResult, error) {
+	override, overrideConfig, source, mode := opts.Harness, opts.Config, opts.Source, opts.InterfaceMode
+	prs, err := e.triggerTargetPRs(ctx, workerID, opts.PRURL)
+	if err != nil {
+		return TriggerResult{}, err
+	}
+	if onlyPRs != nil {
+		var only []domain.PullRequest
+		for _, pr := range prs {
+			if onlyPRs[pr.URL] {
+				only = append(only, pr)
+			}
+		}
+		prs = only
+	}
+	// legacyFor names the reviewer a pass recorded without one belongs to on a
+	// head: its open cycle's first member, else the session's own reviewer.
+	cycles, err := e.store.ListOpenReviewCyclesBySession(ctx, workerID)
+	if err != nil {
+		return TriggerResult{}, err
+	}
+	cycleFor := func(prURL, targetSHA string) (domain.ReviewCycle, bool) {
+		for _, c := range cycles {
+			if c.PRURL == prURL && c.TargetSHA == targetSHA {
+				return c, true
+			}
+		}
+		return domain.ReviewCycle{}, false
+	}
+	if opts.cycleScope {
+		// A reviewer that a head's frozen cycle does not list owes that head
+		// nothing; reviewing it would add a reviewer the cycle never required.
+		var scoped []domain.PullRequest
+		for _, pr := range prs {
+			if c, ok := cycleFor(pr.URL, pr.HeadSHA); ok && !slices.Contains(c.Harnesses(), opts.Harness) {
+				continue
+			}
+			scoped = append(scoped, pr)
+		}
+		prs = scoped
 	}
 	runs, err := e.store.ListReviewRunsBySession(ctx, workerID)
 	if err != nil {
 		return TriggerResult{}, err
-	}
-
-	if err := overrideConfig.Validate(); err != nil {
-		return TriggerResult{}, fmt.Errorf("%w: reviewer config: %w", ErrInvalid, err)
 	}
 
 	harness, config, err := e.reviewerSelection(ctx, worker)
@@ -367,17 +477,27 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	resolvedConfig := config
 	hasHarnessOverride := override != ""
 	hasConfigOverride := false
-	if hasHarnessOverride {
+	switch {
+	case onlyPRs != nil:
+		// A review-cycle member runs with the agent config frozen in the
+		// cycle, not merged over the config as it is now.
+		harness, config = override, overrideConfig
+		hasConfigOverride = override == resolvedHarness && config != resolvedConfig
+	case hasHarnessOverride:
 		harness = override
 		if override == resolvedHarness {
 			config = mergeReviewerAgentConfig(resolvedConfig, overrideConfig)
 			hasConfigOverride = config != resolvedConfig
-		} else if !overrideConfig.IsZero() {
-			config = mergeReviewerAgentConfig(domain.AgentConfig{}, overrideConfig)
 		} else {
-			config = domain.AgentConfig{}
+			// Another expected reviewer starts from its own configured agent
+			// config; a harness outside the expected set starts empty.
+			base, err := e.expectedReviewerConfig(ctx, worker, override)
+			if err != nil {
+				return TriggerResult{}, err
+			}
+			config = mergeReviewerAgentConfig(base, overrideConfig)
 		}
-	} else if !overrideConfig.IsZero() {
+	case !overrideConfig.IsZero():
 		config = mergeReviewerAgentConfig(config, overrideConfig)
 		hasConfigOverride = config != resolvedConfig
 	}
@@ -423,6 +543,19 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 		}
 	}
 	hadRunningReviewer := reviewRunsContainRunningForHarness(runs, harness)
+	// busyOnTargets decides whether this trigger reuses a running pass instead
+	// of starting one. A cycle launch only cares about the heads it was queued
+	// for: a pass of this reviewer still running on an older head or a closed
+	// PR is superseded below, while its live pane may still be reused.
+	busyOnTargets := hadRunningReviewer
+	if onlyPRs != nil {
+		busyOnTargets = false
+		for _, pr := range prs {
+			if headRunningForHarness(runs, pr.URL, pr.HeadSHA, harness) {
+				busyOnTargets = true
+			}
+		}
+	}
 	reviews := Plan(prs, runs)
 	if source == domain.ReviewTriggerAuto || opts.Rerun {
 		reviews = Plan(prs, reviewRunsForHarness(runs, harness))
@@ -430,7 +563,7 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 		// already reviewing one. Reconciliation above has proved the reviewer
 		// terminal is still alive, so do not append work to its active batch. A
 		// later sweep can start the remaining PR after the current run terminates.
-		if hadRunningReviewer {
+		if busyOnTargets {
 			// A person's rerun reuses the pass already running for this reviewer;
 			// an agent asked for new work and must hear that none started.
 			if opts.Rerun && source == domain.ReviewTriggerAgent {
@@ -448,6 +581,9 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	}
 
 	now := e.clock()
+	if now.Before(opts.notBefore) {
+		now = opts.notBefore
+	}
 	reviewRow, err = e.upsertReview(ctx, worker, harness, reviewRow.ReviewerHandleID, reviewRow.AgentSessionID, reviewRow.ReviewerLaunchID, domain.ActivityActive, now)
 	if err != nil {
 		return TriggerResult{}, err
@@ -468,12 +604,22 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 		// so refusing it makes the reviewer choice inert exactly when it is most
 		// useful. Ineligible PRs stay excluded: nothing can review those.
 		eligible := reviewState.Status == ReviewStateNeedsReview || (source != domain.ReviewTriggerAuto && reviewState.Status == ReviewStateChangesRequested) || (opts.Rerun && reviewState.Status != ReviewStateIneligible)
-		if source == domain.ReviewTriggerAuto && autoReviewHeadBlocked(runs, reviewState.PRURL, reviewState.TargetSHA, harness) {
+		legacy := resolvedHarness
+		if c, ok := cycleFor(reviewState.PRURL, reviewState.TargetSHA); ok {
+			legacy = c.LegacyHarness()
+		}
+		if source == domain.ReviewTriggerAuto && autoReviewHeadBlocked(harnessRunsOnHead(runs, reviewState.PRURL, reviewState.TargetSHA, harness, legacy), reviewState.PRURL, reviewState.TargetSHA, harness) {
 			eligible = false
 		}
 		switch {
 		case reviewState.Status == ReviewStateIneligible:
 			continue
+		case onlyPRs != nil:
+			// The review queue already decided this head owes the reviewer a
+			// pass (#5465); only a pass of it already running is reused.
+			if headRunningForHarness(runs, reviewState.PRURL, reviewState.TargetSHA, harness) {
+				continue
+			}
 		case opts.Rerun:
 			// An explicit rerun reviews the head again, except that one reviewer
 			// is never started twice on the same head concurrently.
@@ -1541,12 +1687,16 @@ func (e *Engine) listLocked(ctx stdctx.Context, workerID domain.SessionID, selec
 	if err != nil {
 		return SessionReviews{}, err
 	}
+	expected, err := e.expectedReviewerHarnesses(ctx, workerID)
+	if err != nil {
+		return SessionReviews{}, err
+	}
 	return SessionReviews{
 		ReviewerHandleID:      legacyReviewerHandle(reviewRow),
 		ReviewerHarness:       reviewerHarness,
 		ReviewerActivityState: reviewRow.ReviewerActivityState,
 		Runs:                  runs,
-		Reviews:               Plan(prs, runs),
+		Reviews:               PlanWithExpected(prs, runs, expected),
 		ReviewerSurface:       reviewerSurface(reviewRow),
 		ActiveReviewers:       active,
 	}, nil
@@ -1923,17 +2073,26 @@ func mergeReviewerAgentConfig(base, override domain.AgentConfig) domain.AgentCon
 	return base
 }
 
+// projectConfig reads the worker's project config; a missing project or no
+// project store yields the zero config.
+func (e *Engine) projectConfig(ctx stdctx.Context, worker domain.SessionRecord) (domain.ProjectConfig, error) {
+	if e.projects == nil {
+		return domain.ProjectConfig{}, nil
+	}
+	proj, ok, err := e.projects.GetProject(ctx, string(worker.ProjectID))
+	if err != nil || !ok {
+		return domain.ProjectConfig{}, err
+	}
+	return proj.Config, nil
+}
+
 func (e *Engine) projectReviewerSelection(
 	ctx stdctx.Context,
 	worker domain.SessionRecord,
 ) (domain.ReviewerHarness, domain.AgentConfig, error) {
-	var cfg domain.ProjectConfig
-	if e.projects != nil {
-		if proj, ok, err := e.projects.GetProject(ctx, string(worker.ProjectID)); err != nil {
-			return "", domain.AgentConfig{}, err
-		} else if ok {
-			cfg = proj.Config
-		}
+	cfg, err := e.projectConfig(ctx, worker)
+	if err != nil {
+		return "", domain.AgentConfig{}, err
 	}
 	if len(cfg.Reviewers) > 0 {
 		return cfg.Reviewers[0].Harness, cfg.Reviewers[0].AgentConfig, nil
@@ -1943,6 +2102,40 @@ func (e *Engine) projectReviewerSelection(
 		return harness, config, nil
 	}
 	return cfg.ResolveReviewerHarness(worker.Harness), domain.AgentConfig{}, nil
+}
+
+// expectedReviewerConfig returns the agent config of harness's entry in the
+// worker's expected reviewers, or an empty config when harness is not one of
+// them.
+func (e *Engine) expectedReviewerConfig(
+	ctx stdctx.Context,
+	worker domain.SessionRecord,
+	harness domain.ReviewerHarness,
+) (domain.AgentConfig, error) {
+	cfg, err := e.projectConfig(ctx, worker)
+	if err != nil {
+		return domain.AgentConfig{}, err
+	}
+	for _, reviewer := range cfg.ExpectedReviewers(worker) {
+		if reviewer.Harness == harness {
+			return reviewer.AgentConfig, nil
+		}
+	}
+	return domain.AgentConfig{}, nil
+}
+
+// expectedReviewerHarnesses re-reads the worker so a reviewer switch made under
+// the same lock is already reflected in the reviewers its PR heads expect. A
+// head with an open review cycle expects that cycle's reviewers.
+func (e *Engine) expectedReviewerHarnesses(ctx stdctx.Context, workerID domain.SessionID) (func(prURL, targetSHA string) HeadReviewers, error) {
+	worker, ok, err := e.sessions.GetSession(ctx, workerID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return func(string, string) HeadReviewers { return HeadReviewers{} }, nil
+	}
+	return e.expectedReviewersByHead(ctx, workerID, worker)
 }
 
 func (e *Engine) projectEnv(ctx stdctx.Context, id domain.ProjectID) (map[string]string, error) {

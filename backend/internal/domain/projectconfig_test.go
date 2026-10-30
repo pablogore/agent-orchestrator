@@ -38,6 +38,8 @@ func TestProjectConfigValidate(t *testing.T) {
 		{"agent rules file bare dot", ProjectConfig{AgentRulesFile: "."}, true},
 		{"good reviewers", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerClaudeCode}}}, false},
 		{"good codex reviewer", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerCodex}}}, false},
+		{"two different reviewers", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerClaudeCode}, {Harness: ReviewerCodex}}}, false},
+		{"same reviewer twice", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerCodex}, {Harness: ReviewerCodex, AgentConfig: AgentConfig{Model: "m"}}}}, true},
 		{"good copilot reviewer", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerCopilot}}}, false},
 		{"good cursor reviewer", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerCursor}}}, false},
 		{"good Kilo Code reviewer", ProjectConfig{Reviewers: []ReviewerConfig{{Harness: ReviewerKiloCode}}}, false},
@@ -218,5 +220,37 @@ func TestProjectConfigIsZero(t *testing.T) {
 	}
 	if (ProjectConfig{AutoReview: true}).IsZero() {
 		t.Fatal("config with autoReview enabled should not be zero")
+	}
+}
+
+func TestExpectedReviewers(t *testing.T) {
+	two := []ReviewerConfig{{Harness: ReviewerClaudeCode, AgentConfig: AgentConfig{Model: "opus"}}, {Harness: ReviewerCodex}}
+	tests := []struct {
+		name    string
+		cfg     ProjectConfig
+		session SessionRecord
+		want    []ReviewerHarness
+	}{
+		{"every configured reviewer in order", ProjectConfig{Reviewers: two}, SessionRecord{Harness: HarnessCodex}, []ReviewerHarness{ReviewerClaudeCode, ReviewerCodex}},
+		{"session reviewer replaces the project set", ProjectConfig{Reviewers: two}, SessionRecord{ReviewerHarness: ReviewerOpenCode}, []ReviewerHarness{ReviewerOpenCode}},
+		{"default worker reviewer when none configured", ProjectConfig{Worker: RoleOverride{Harness: HarnessCodex}}, SessionRecord{Harness: HarnessClaudeCode}, []ReviewerHarness{ReviewerCodex}},
+		{"worker harness fallback when none configured", ProjectConfig{}, SessionRecord{Harness: HarnessCodex}, []ReviewerHarness{ReviewerCodex}},
+		{"claude-code fallback for a non-reviewer worker", ProjectConfig{}, SessionRecord{Harness: HarnessCrush}, []ReviewerHarness{FallbackReviewerHarness}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.ExpectedReviewers(tt.session)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %+v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i].Harness != tt.want[i] {
+					t.Fatalf("got %+v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+	if got := (ProjectConfig{Reviewers: two}).ExpectedReviewers(SessionRecord{}); got[0].AgentConfig.Model != "opus" {
+		t.Fatalf("configured reviewer config lost: %+v", got[0])
 	}
 }

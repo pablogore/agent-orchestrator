@@ -14,6 +14,17 @@ type fakeStore struct {
 	project domain.ProjectRecord
 	prs     []domain.PullRequest
 	runs    []domain.ReviewRun
+	// cycles are the session's open review cycles; cycleSessions lists the
+	// sessions the sweep finds with an open cycle.
+	cycles        []domain.ReviewCycle
+	cycleSessions []domain.SessionID
+}
+
+func (f *fakeStore) ListOpenReviewCyclesBySession(context.Context, domain.SessionID) ([]domain.ReviewCycle, error) {
+	return f.cycles, nil
+}
+func (f *fakeStore) ListSessionsWithOpenReviewCycles(context.Context) ([]domain.SessionID, error) {
+	return f.cycleSessions, nil
 }
 
 func (f *fakeStore) GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -33,9 +44,15 @@ func (f *fakeStore) ListReviewRunsBySession(context.Context, domain.SessionID) (
 }
 
 type fakeTrigger struct {
-	calls   int
-	harness domain.ReviewerHarness
-	result  reviewcore.TriggerResult
+	calls    int
+	harness  domain.ReviewerHarness
+	result   reviewcore.TriggerResult
+	advanced []domain.SessionID
+}
+
+func (f *fakeTrigger) AdvanceCycles(_ context.Context, id domain.SessionID) (reviewcore.TriggerResult, error) {
+	f.advanced = append(f.advanced, id)
+	return reviewcore.TriggerResult{}, nil
 }
 
 func (f *fakeTrigger) TriggerAuto(_ context.Context, _ domain.SessionID, harness domain.ReviewerHarness) (reviewcore.TriggerResult, error) {
@@ -270,6 +287,10 @@ type notifyingTrigger struct {
 func (f *notifyingTrigger) TriggerAuto(_ context.Context, id domain.SessionID, _ domain.ReviewerHarness) (reviewcore.TriggerResult, error) {
 	f.called <- id
 	return reviewcore.TriggerResult{Created: true}, nil
+}
+
+func (f *notifyingTrigger) AdvanceCycles(context.Context, domain.SessionID) (reviewcore.TriggerResult, error) {
+	return reviewcore.TriggerResult{}, nil
 }
 
 func TestCoordinatorPeriodicallyEvaluatesPersistedFacts(t *testing.T) {

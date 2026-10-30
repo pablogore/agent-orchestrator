@@ -41,6 +41,59 @@ type fakeStore struct {
 	recoverableReviewsErr  error
 	recoveryErrors         map[string]string
 	settledReviewIDs       []string
+	cycles                 []domain.ReviewCycle
+}
+
+func (f *fakeStore) InsertReviewCycle(_ context.Context, c domain.ReviewCycle) error {
+	for _, existing := range f.cycles {
+		if existing.Open() && existing.SessionID == c.SessionID && existing.PRURL == c.PRURL {
+			return domain.ErrDuplicateReviewCycle
+		}
+	}
+	c.Members = append([]domain.ReviewCycleMember(nil), c.Members...)
+	f.cycles = append(f.cycles, c)
+	return nil
+}
+
+func (f *fakeStore) ListOpenReviewCyclesBySession(_ context.Context, id domain.SessionID) ([]domain.ReviewCycle, error) {
+	var out []domain.ReviewCycle
+	for _, c := range f.cycles {
+		if c.Open() && c.SessionID == id {
+			c.Members = append([]domain.ReviewCycleMember(nil), c.Members...)
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) SupersedeReviewCycle(_ context.Context, id, reason string, at time.Time) (bool, error) {
+	for i := range f.cycles {
+		if f.cycles[i].ID == id && f.cycles[i].Open() {
+			f.cycles[i].SupersededAt = at
+			if at.IsZero() {
+				f.cycles[i].SupersededAt = time.Unix(1, 0).UTC()
+			}
+			f.cycles[i].SupersededReason = reason
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeStore) SetReviewCycleMemberQueued(_ context.Context, cycleID string, harness domain.ReviewerHarness, at time.Time, source domain.ReviewTriggerSource) (bool, error) {
+	for i := range f.cycles {
+		if f.cycles[i].ID != cycleID || !f.cycles[i].Open() {
+			continue
+		}
+		for j := range f.cycles[i].Members {
+			if f.cycles[i].Members[j].Harness == harness {
+				f.cycles[i].Members[j].QueuedAt = at
+				f.cycles[i].Members[j].QueuedSource = source
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (f *fakeStore) UpsertReview(_ context.Context, r domain.Review) error {

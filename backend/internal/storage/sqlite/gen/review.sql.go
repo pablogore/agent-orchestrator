@@ -7,6 +7,7 @@ package gen
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -400,6 +401,58 @@ func (q *Queries) GetReviewRunBySessionPRSHAAndHarness(ctx context.Context, arg 
 	return i, err
 }
 
+const insertReviewCycle = `-- name: InsertReviewCycle :exec
+INSERT INTO review_cycle (id, session_id, pr_url, target_sha, created_at)
+VALUES (?, ?, ?, ?, ?)
+`
+
+type InsertReviewCycleParams struct {
+	ID        string
+	SessionID domain.SessionID
+	PRURL     string
+	TargetSha string
+	CreatedAt time.Time
+}
+
+// Opens a review cycle (#5465). The partial unique index on open cycles makes a
+// second open cycle for the same (session, pr) fail.
+func (q *Queries) InsertReviewCycle(ctx context.Context, arg InsertReviewCycleParams) error {
+	_, err := q.db.ExecContext(ctx, insertReviewCycle,
+		arg.ID,
+		arg.SessionID,
+		arg.PRURL,
+		arg.TargetSha,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertReviewCycleMember = `-- name: InsertReviewCycleMember :exec
+INSERT INTO review_cycle_member (cycle_id, position, harness, agent_config, queued_at, queued_source)
+VALUES (?, ?, ?, ?, ?, ?)
+`
+
+type InsertReviewCycleMemberParams struct {
+	CycleID      string
+	Position     int64
+	Harness      domain.ReviewerHarness
+	AgentConfig  string
+	QueuedAt     sql.NullTime
+	QueuedSource domain.ReviewTriggerSource
+}
+
+func (q *Queries) InsertReviewCycleMember(ctx context.Context, arg InsertReviewCycleMemberParams) error {
+	_, err := q.db.ExecContext(ctx, insertReviewCycleMember,
+		arg.CycleID,
+		arg.Position,
+		arg.Harness,
+		arg.AgentConfig,
+		arg.QueuedAt,
+		arg.QueuedSource,
+	)
+	return err
+}
+
 const insertReviewRun = `-- name: InsertReviewRun :exec
 INSERT INTO review_run (id, review_id, session_id, batch_id, harness, trigger_source, pr_url, target_sha, status, verdict, body, github_review_id, created_at, auto_inject_review)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -606,6 +659,101 @@ func (q *Queries) ListLiveReviewerHandles(ctx context.Context) ([]ListLiveReview
 			&i.SessionID,
 			&i.Harness,
 			&i.ReviewerHandleID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOpenReviewCycleMembersBySessions = `-- name: ListOpenReviewCycleMembersBySessions :many
+WITH wanted_session AS (
+    SELECT CAST(j.value AS TEXT) AS session_id
+    FROM json_each(?) AS j
+)
+SELECT review_cycle_member.cycle_id, review_cycle_member.position, review_cycle_member.harness,
+       review_cycle_member.agent_config, review_cycle_member.queued_at, review_cycle_member.queued_source
+FROM review_cycle_member
+JOIN review_cycle ON review_cycle.id = review_cycle_member.cycle_id
+JOIN wanted_session ON wanted_session.session_id = review_cycle.session_id
+WHERE review_cycle.superseded_at IS NULL
+ORDER BY review_cycle_member.cycle_id, review_cycle_member.position
+`
+
+// Members of the open cycles for a JSON array of session ids, in queue order.
+func (q *Queries) ListOpenReviewCycleMembersBySessions(ctx context.Context, jsonEach interface{}) ([]ReviewCycleMember, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenReviewCycleMembersBySessions, jsonEach)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ReviewCycleMember{}
+	for rows.Next() {
+		var i ReviewCycleMember
+		if err := rows.Scan(
+			&i.CycleID,
+			&i.Position,
+			&i.Harness,
+			&i.AgentConfig,
+			&i.QueuedAt,
+			&i.QueuedSource,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOpenReviewCyclesBySessions = `-- name: ListOpenReviewCyclesBySessions :many
+WITH wanted_session AS (
+    SELECT CAST(j.value AS TEXT) AS session_id
+    FROM json_each(?) AS j
+)
+SELECT review_cycle.id, review_cycle.session_id, review_cycle.pr_url, review_cycle.target_sha, review_cycle.created_at
+FROM review_cycle
+JOIN wanted_session ON wanted_session.session_id = review_cycle.session_id
+WHERE review_cycle.superseded_at IS NULL
+ORDER BY review_cycle.session_id, review_cycle.created_at, review_cycle.id
+`
+
+type ListOpenReviewCyclesBySessionsRow struct {
+	ID        string
+	SessionID domain.SessionID
+	PRURL     string
+	TargetSha string
+	CreatedAt time.Time
+}
+
+// Open cycles for a JSON array of session ids, oldest first.
+func (q *Queries) ListOpenReviewCyclesBySessions(ctx context.Context, jsonEach interface{}) ([]ListOpenReviewCyclesBySessionsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenReviewCyclesBySessions, jsonEach)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenReviewCyclesBySessionsRow{}
+	for rows.Next() {
+		var i ListOpenReviewCyclesBySessionsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.PRURL,
+			&i.TargetSha,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -885,6 +1033,36 @@ func (q *Queries) ListRunningReviewRunsBySession(ctx context.Context, sessionID 
 	return items, nil
 }
 
+const listSessionsWithOpenReviewCycles = `-- name: ListSessionsWithOpenReviewCycles :many
+SELECT DISTINCT session_id
+FROM review_cycle
+WHERE superseded_at IS NULL
+ORDER BY session_id
+`
+
+func (q *Queries) ListSessionsWithOpenReviewCycles(ctx context.Context) ([]domain.SessionID, error) {
+	rows, err := q.db.QueryContext(ctx, listSessionsWithOpenReviewCycles)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []domain.SessionID{}
+	for rows.Next() {
+		var session_id domain.SessionID
+		if err := rows.Scan(&session_id); err != nil {
+			return nil, err
+		}
+		items = append(items, session_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordReviewChatControllerError = `-- name: RecordReviewChatControllerError :execrows
 UPDATE review SET controller_error = ?, updated_at = ? WHERE id = ? AND interface_mode = 'chat' AND is_archived = FALSE
 `
@@ -945,6 +1123,40 @@ func (q *Queries) RestoreReviewLaunchState(ctx context.Context, arg RestoreRevie
 	return result.RowsAffected()
 }
 
+const setReviewCycleMemberQueued = `-- name: SetReviewCycleMemberQueued :execrows
+UPDATE review_cycle_member
+SET queued_at = ?, queued_source = ?
+WHERE cycle_id = ?
+  AND harness = ?
+  AND EXISTS (
+      SELECT 1 FROM review_cycle
+      WHERE review_cycle.id = review_cycle_member.cycle_id
+        AND review_cycle.superseded_at IS NULL
+  )
+`
+
+type SetReviewCycleMemberQueuedParams struct {
+	QueuedAt     sql.NullTime
+	QueuedSource domain.ReviewTriggerSource
+	CycleID      string
+	Harness      domain.ReviewerHarness
+}
+
+// Queues one member of an open cycle: it waits until a pass started at or
+// after queued_at. review_cycle_member_cdc_queue refreshes the worker.
+func (q *Queries) SetReviewCycleMemberQueued(ctx context.Context, arg SetReviewCycleMemberQueuedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setReviewCycleMemberQueued,
+		arg.QueuedAt,
+		arg.QueuedSource,
+		arg.CycleID,
+		arg.Harness,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const setReviewInterfaceMode = `-- name: SetReviewInterfaceMode :execrows
 UPDATE review SET interface_mode = ?, reviewer_handle_id = CASE WHEN ? = 'chat' THEN '' ELSE reviewer_handle_id END,
     provider_conversation_id = CASE WHEN ? = 'tui' THEN '' ELSE provider_conversation_id END,
@@ -970,6 +1182,27 @@ func (q *Queries) SetReviewInterfaceMode(ctx context.Context, arg SetReviewInter
 		arg.UpdatedAt,
 		arg.ID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const supersedeReviewCycle = `-- name: SupersedeReviewCycle :execrows
+UPDATE review_cycle
+SET superseded_at = ?, superseded_reason = ?
+WHERE id = ? AND superseded_at IS NULL
+`
+
+type SupersedeReviewCycleParams struct {
+	SupersededAt     sql.NullTime
+	SupersededReason string
+	ID               string
+}
+
+// Closes an open cycle; a cycle already superseded is left untouched.
+func (q *Queries) SupersedeReviewCycle(ctx context.Context, arg SupersedeReviewCycleParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, supersedeReviewCycle, arg.SupersededAt, arg.SupersededReason, arg.ID)
 	if err != nil {
 		return 0, err
 	}

@@ -58,9 +58,12 @@ type KanbanReviewRunFacts struct {
 	// ChangesRequested reports that a pass for the current head asked the
 	// worker for changes.
 	ChangesRequested bool
-	// Outcome reports that a pass for the current head returned a verdict.
-	// Present without Outcome is a head AO tried and failed to review, which
-	// still owes the PR the pass auto review promised it.
+	// Outcome reports that every reviewer required on the current head
+	// returned a verdict there: each reviewer the session expects plus every
+	// reviewer that ran on that head. Present without Outcome is a head AO has
+	// not finished reviewing (a required pass failed, was cancelled, is still
+	// running, or has not run), which still owes the PR the passes auto review
+	// promised it.
 	Outcome bool
 	// Failed reports that a pass for the current head ended without producing
 	// a verdict.
@@ -122,9 +125,10 @@ func derivePRKanbanColumn(session KanbanSessionFacts, pr KanbanPRFacts) KanbanCo
 	}
 }
 
-// approvedByAO reports whether AO's own review pass approved the PR's current
-// head. A pass that requested changes, one that has not run yet, and one that
-// failed or was cancelled without a verdict are all "not approved."
+// approvedByAO reports whether AO's own review passes approved the PR's current
+// head: every required reviewer returned a verdict and none requested changes.
+// A pass that requested changes, a required one that has not run yet, and one
+// that failed or was cancelled without a verdict are all "not approved."
 func approvedByAO(pr KanbanPRFacts) bool {
 	return pr.ReviewRun.Outcome && !pr.ReviewRun.ChangesRequested
 }

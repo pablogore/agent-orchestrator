@@ -49,6 +49,8 @@ type Store interface {
 	ListPRFactsForSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID][]domain.PRFacts, error)
 	ListCurrentHeadReviewRunsForSession(ctx context.Context, id domain.SessionID) ([]domain.CurrentHeadReviewRun, error)
 	ListCurrentHeadReviewRunsForSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID][]domain.CurrentHeadReviewRun, error)
+	ListOpenReviewCyclesBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewCycle, error)
+	ListOpenReviewCyclesForSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID][]domain.ReviewCycle, error)
 	ListInterruptedSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID]bool, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
 	ListReportedPRURLs(ctx context.Context, id domain.SessionID) ([]string, error)
@@ -1392,10 +1394,14 @@ func (s *Service) sessionsFromRecords(ctx context.Context, filtered []domain.Ses
 			return nil, fmt.Errorf("list workspace cleanup facts: %w", err)
 		}
 	}
+	reads, err := s.prefetchReviewerReads(ctx, ids, runsBySession)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]domain.Session, 0, len(filtered))
 	for _, rec := range filtered {
 		facts, found := cleanupBySession[rec.ID]
-		sess, err := s.toSessionWithFacts(ctx, rec, prsBySession[rec.ID], runsBySession[rec.ID], interrupted[rec.ID], currentWorkspaceCleanup(rec, facts, found))
+		sess, err := s.sessionWithFacts(ctx, rec, prsBySession[rec.ID], runsBySession[rec.ID], interrupted[rec.ID], currentWorkspaceCleanup(rec, facts, found), reads)
 		if err != nil {
 			return nil, err
 		}
@@ -1497,6 +1503,133 @@ func (s *Service) Get(ctx context.Context, id domain.SessionID) (domain.Session,
 }
 
 func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionRecord, prs []domain.PRFacts, runs []domain.CurrentHeadReviewRun, interrupted bool, cleanup domain.WorkspaceDisposition) (domain.Session, error) {
+	return s.sessionWithFacts(ctx, rec, prs, runs, interrupted, cleanup, nil)
+}
+
+// reviewerReads caches one read's expected-reviewer lookups: a list reads each
+// project once instead of once per session, and reads every session's open
+// review cycles in one query.
+type reviewerReads struct {
+	projects map[domain.ProjectID]reviewerProject
+	// cycles holds the prefetched open review cycles by session; nil means
+	// each session reads its own.
+	cycles map[domain.SessionID][]domain.ReviewCycle
+}
+
+type reviewerProject struct {
+	record domain.ProjectRecord
+	found  bool
+}
+
+// prefetchReviewerReads reads, in one query, the open review cycles of every
+// session with review runs. Sessions without runs skip it, as
+// expectedReviewerHarnesses does.
+func (s *Service) prefetchReviewerReads(ctx context.Context, ids []domain.SessionID, runsBySession map[domain.SessionID][]domain.CurrentHeadReviewRun) (*reviewerReads, error) {
+	reads := &reviewerReads{projects: map[domain.ProjectID]reviewerProject{}, cycles: map[domain.SessionID][]domain.ReviewCycle{}}
+	var reviewed []domain.SessionID
+	for _, id := range ids {
+		if len(runsBySession[id]) > 0 {
+			reviewed = append(reviewed, id)
+		}
+	}
+	if len(reviewed) == 0 {
+		return reads, nil
+	}
+	cycles, err := s.store.ListOpenReviewCyclesForSessions(ctx, reviewed)
+	if err != nil {
+		return nil, fmt.Errorf("list open review cycles: %w", err)
+	}
+	if cycles != nil {
+		reads.cycles = cycles
+	}
+	return reads, nil
+}
+
+// expectedReviewerHarnesses names the reviewers that must each approve each of
+// the session's PR heads (see expectedReviewers). It only reads when there are
+// runs to judge: a PR AO never reviewed is placed the same way whatever is
+// expected. An unknown project contributes no list, so a PR without a cycle
+// requires only the reviewers that ran. reads may be nil.
+func (s *Service) expectedReviewerHarnesses(ctx context.Context, rec domain.SessionRecord, prs []domain.PRFacts, runs []domain.CurrentHeadReviewRun, reads *reviewerReads) (expectedReviewers, error) {
+	if len(runs) == 0 || s.store == nil {
+		return expectedReviewers{}, nil
+	}
+	project, err := s.projectReviewerHarnesses(ctx, rec, reads)
+	if err != nil {
+		return expectedReviewers{}, err
+	}
+	cycles, err := s.openReviewCycles(ctx, rec.ID, reads)
+	if err != nil {
+		return expectedReviewers{}, err
+	}
+	expected := expectedReviewers{project: project}
+	for _, pr := range prs {
+		for _, cycle := range cycles {
+			// A cycle for an older head no longer decides the PR.
+			if !cycle.Open() || cycle.PRURL != pr.URL || cycle.TargetSHA == "" || cycle.TargetSHA != pr.HeadSHA {
+				continue
+			}
+			if expected.byPR == nil {
+				expected.byPR = map[string][]domain.ReviewerHarness{}
+				expected.members = map[string]map[domain.ReviewerHarness]domain.ReviewCycleMember{}
+			}
+			expected.byPR[pr.URL] = cycle.Harnesses()
+			members := make(map[domain.ReviewerHarness]domain.ReviewCycleMember, len(cycle.Members))
+			for _, member := range cycle.Members {
+				members[member.Harness] = member
+			}
+			expected.members[pr.URL] = members
+		}
+	}
+	return expected, nil
+}
+
+// projectReviewerHarnesses lists the project config's expected reviewers
+// (domain.ProjectConfig.ExpectedReviewers); an unknown project yields nil.
+func (s *Service) projectReviewerHarnesses(ctx context.Context, rec domain.SessionRecord, reads *reviewerReads) ([]domain.ReviewerHarness, error) {
+	if rec.ProjectID == "" {
+		return nil, nil
+	}
+	var project reviewerProject
+	cached := false
+	if reads != nil {
+		project, cached = reads.projects[rec.ProjectID]
+	}
+	if !cached {
+		record, found, err := s.store.GetProject(ctx, string(rec.ProjectID))
+		if err != nil {
+			return nil, fmt.Errorf("get project %s: %w", rec.ProjectID, err)
+		}
+		project = reviewerProject{record: record, found: found}
+		if reads != nil {
+			reads.projects[rec.ProjectID] = project
+		}
+	}
+	if !project.found {
+		return nil, nil
+	}
+	reviewers := project.record.Config.ExpectedReviewers(rec)
+	harnesses := make([]domain.ReviewerHarness, 0, len(reviewers))
+	for _, reviewer := range reviewers {
+		harnesses = append(harnesses, reviewer.Harness)
+	}
+	return harnesses, nil
+}
+
+// openReviewCycles returns the session's open review cycles, from the list's
+// prefetch when there is one.
+func (s *Service) openReviewCycles(ctx context.Context, id domain.SessionID, reads *reviewerReads) ([]domain.ReviewCycle, error) {
+	if reads != nil && reads.cycles != nil {
+		return reads.cycles[id], nil
+	}
+	cycles, err := s.store.ListOpenReviewCyclesBySession(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("open review cycles %s: %w", id, err)
+	}
+	return cycles, nil
+}
+
+func (s *Service) sessionWithFacts(ctx context.Context, rec domain.SessionRecord, prs []domain.PRFacts, runs []domain.CurrentHeadReviewRun, interrupted bool, cleanup domain.WorkspaceDisposition, reads *reviewerReads) (domain.Session, error) {
 	// A row created before artifact_dir existed carries it as '' (the
 	// migration's default) even though session_manager always prompts the
 	// agent to write into the deterministic dataDir/artifacts/<id> path.
@@ -1551,7 +1684,11 @@ func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionReco
 	// ReconcileSessionOutputType is the sole writer); it is deliberately not
 	// recomputed here so the API and Kanban see the same durable
 	// classification rather than a value that can differ read to read.
-	presentation := deriveKanbanPresentation(rec, prs, runs, interrupted, now, s.harnessSignals(rec.Harness))
+	expected, err := s.expectedReviewerHarnesses(ctx, rec, prs, runs, reads)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	presentation := deriveKanbanPresentation(rec, prs, runs, expected, interrupted, now, s.harnessSignals(rec.Harness))
 	readiness := "ready"
 	if recovery, ok := s.manager.(interface {
 		SessionStatusReadiness(domain.SessionRecord) string

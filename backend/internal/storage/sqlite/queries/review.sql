@@ -193,3 +193,64 @@ WHERE status = 'running' AND verdict = '' AND batch_id != ''
 -- name: ArchiveReviewsBySession :exec
 UPDATE review SET is_archived = TRUE, reviewer_handle_id = '', reviewer_launch_id = '',
     controller_generation = '', reviewer_activity_state = 'exited', updated_at = ? WHERE session_id = ?;
+
+-- name: InsertReviewCycle :exec
+-- Opens a review cycle (#5465). The partial unique index on open cycles makes a
+-- second open cycle for the same (session, pr) fail.
+INSERT INTO review_cycle (id, session_id, pr_url, target_sha, created_at)
+VALUES (?, ?, ?, ?, ?);
+
+-- name: InsertReviewCycleMember :exec
+INSERT INTO review_cycle_member (cycle_id, position, harness, agent_config, queued_at, queued_source)
+VALUES (?, ?, ?, ?, ?, ?);
+
+-- name: ListOpenReviewCyclesBySessions :many
+-- Open cycles for a JSON array of session ids, oldest first.
+WITH wanted_session AS (
+    SELECT CAST(j.value AS TEXT) AS session_id
+    FROM json_each(?) AS j
+)
+SELECT review_cycle.id, review_cycle.session_id, review_cycle.pr_url, review_cycle.target_sha, review_cycle.created_at
+FROM review_cycle
+JOIN wanted_session ON wanted_session.session_id = review_cycle.session_id
+WHERE review_cycle.superseded_at IS NULL
+ORDER BY review_cycle.session_id, review_cycle.created_at, review_cycle.id;
+
+-- name: ListOpenReviewCycleMembersBySessions :many
+-- Members of the open cycles for a JSON array of session ids, in queue order.
+WITH wanted_session AS (
+    SELECT CAST(j.value AS TEXT) AS session_id
+    FROM json_each(?) AS j
+)
+SELECT review_cycle_member.cycle_id, review_cycle_member.position, review_cycle_member.harness,
+       review_cycle_member.agent_config, review_cycle_member.queued_at, review_cycle_member.queued_source
+FROM review_cycle_member
+JOIN review_cycle ON review_cycle.id = review_cycle_member.cycle_id
+JOIN wanted_session ON wanted_session.session_id = review_cycle.session_id
+WHERE review_cycle.superseded_at IS NULL
+ORDER BY review_cycle_member.cycle_id, review_cycle_member.position;
+
+-- name: ListSessionsWithOpenReviewCycles :many
+SELECT DISTINCT session_id
+FROM review_cycle
+WHERE superseded_at IS NULL
+ORDER BY session_id;
+
+-- name: SupersedeReviewCycle :execrows
+-- Closes an open cycle; a cycle already superseded is left untouched.
+UPDATE review_cycle
+SET superseded_at = ?, superseded_reason = ?
+WHERE id = ? AND superseded_at IS NULL;
+
+-- name: SetReviewCycleMemberQueued :execrows
+-- Queues one member of an open cycle: it waits until a pass started at or
+-- after queued_at. review_cycle_member_cdc_queue refreshes the worker.
+UPDATE review_cycle_member
+SET queued_at = ?, queued_source = ?
+WHERE cycle_id = ?
+  AND harness = ?
+  AND EXISTS (
+      SELECT 1 FROM review_cycle
+      WHERE review_cycle.id = review_cycle_member.cycle_id
+        AND review_cycle.superseded_at IS NULL
+  );

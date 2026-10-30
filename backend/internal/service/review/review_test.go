@@ -1095,3 +1095,83 @@ func TestSubmitRequestsReviewRefreshForProviderPostedReview(t *testing.T) {
 		t.Fatalf("a review not posted to the provider requested a refresh: %v", refresher.prURLs)
 	}
 }
+
+// A submitted result moves the worker's review queue on to the next reviewer
+// its cycle owes (#5465). Re-submitting the same result does not, and a queue
+// failure never fails the submission.
+func TestSubmitAdvancesReviewCycles(t *testing.T) {
+	st := &fakeStore{
+		ok:  true,
+		run: domain.ReviewRun{ID: "run-1", SessionID: "mer-1", BatchID: "batch-1", PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning},
+		prs: []domain.PullRequest{{URL: "pr1", HeadSHA: "sha1"}},
+	}
+	svc := New(nil, st)
+	var advanced []domain.SessionID
+	svc.engineAdvance = func(_ context.Context, id domain.SessionID) (reviewcore.TriggerResult, error) {
+		advanced = append(advanced, id)
+		return reviewcore.TriggerResult{}, errors.New("launch failed")
+	}
+	// The next reviewer shares the submitting reviewer's terminal, so the
+	// queue must move only after the submit has answered.
+	var deferred []func()
+	svc.afterSubmit = func(f func()) { deferred = append(deferred, f) }
+
+	if _, err := svc.Submit(context.Background(), "mer-1", "run-1", domain.VerdictApproved, "ok", ""); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if len(advanced) != 0 || len(deferred) != 1 {
+		t.Fatalf("advanced = %v, deferred = %d; want the queue step deferred past the submit", advanced, len(deferred))
+	}
+	deferred[0]()
+	if len(advanced) != 1 || advanced[0] != "mer-1" {
+		t.Fatalf("advanced = %v, want the queue advanced once for mer-1", advanced)
+	}
+	if _, err := svc.Submit(context.Background(), "mer-1", "run-1", domain.VerdictApproved, "ok", ""); err != nil {
+		t.Fatalf("re-Submit: %v", err)
+	}
+	if len(advanced) != 1 {
+		t.Fatalf("advanced = %v, want no second advance for an already recorded result", advanced)
+	}
+}
+
+// The deferred queue step waits out its delay and is dropped once the daemon
+// shuts down, so it never launches a reviewer during shutdown.
+func TestRunAfterDelayRespectsCancellation(t *testing.T) {
+	ran := false
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runAfterDelay(ctx, 0, func() { ran = true })
+	if ran {
+		t.Fatal("queue step ran after the daemon context was cancelled")
+	}
+	runAfterDelay(context.Background(), 0, func() { ran = true })
+	if !ran {
+		t.Fatal("queue step did not run on a live context")
+	}
+}
+
+// The deferred queue step runs with the daemon's context, not the submit
+// request's: the request ends before it runs, and shutdown must cancel it.
+func TestSubmitAdvanceUsesTheBackgroundContext(t *testing.T) {
+	st := &fakeStore{
+		ok:  true,
+		run: domain.ReviewRun{ID: "run-1", SessionID: "mer-1", BatchID: "batch-1", PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning},
+		prs: []domain.PullRequest{{URL: "pr1", HeadSHA: "sha1"}},
+	}
+	type key struct{}
+	background := context.WithValue(context.Background(), key{}, "daemon")
+	svc := New(nil, st, WithBackgroundContext(background))
+	var got context.Context
+	svc.engineAdvance = func(ctx context.Context, _ domain.SessionID) (reviewcore.TriggerResult, error) {
+		got = ctx
+		return reviewcore.TriggerResult{}, nil
+	}
+	svc.afterSubmit = func(f func()) { f() }
+
+	if _, err := svc.Submit(context.Background(), "mer-1", "run-1", domain.VerdictApproved, "ok", ""); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if got == nil || got.Value(key{}) != "daemon" {
+		t.Fatalf("advance ran with %v, want the daemon context", got)
+	}
+}

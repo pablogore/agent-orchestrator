@@ -643,6 +643,25 @@ type Review struct {
 	IsArchived             bool
 }
 
+type ReviewCycle struct {
+	ID               string
+	SessionID        domain.SessionID
+	PRURL            string
+	TargetSha        string
+	CreatedAt        time.Time
+	SupersededAt     sql.NullTime
+	SupersededReason string
+}
+
+type ReviewCycleMember struct {
+	CycleID      string
+	Position     int64
+	Harness      domain.ReviewerHarness
+	AgentConfig  string
+	QueuedAt     sql.NullTime
+	QueuedSource domain.ReviewTriggerSource
+}
+
 type ReviewRun struct {
 	ID               string
 	ReviewID         string

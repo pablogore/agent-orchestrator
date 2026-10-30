@@ -94,6 +94,10 @@ func (f *fakeReviewService) ResolveReviewComment(_ context.Context, workerID dom
 	return f.resolveErr
 }
 
+func (f *fakeReviewService) AdvanceCycles(context.Context, domain.SessionID) (reviewcore.TriggerResult, error) {
+	return reviewcore.TriggerResult{}, nil
+}
+
 func (f *fakeReviewService) TriggerAuto(context.Context, domain.SessionID, domain.ReviewerHarness) (reviewcore.TriggerResult, error) {
 	return reviewcore.TriggerResult{}, nil
 }

@@ -88,6 +88,12 @@ type fakeStore struct {
 	getCleanupFactsCalls  int
 	listCleanupFactsCalls int
 	cleanupFactsRequested []domain.SessionID
+
+	// reviewCycles holds open review cycles; the counters split single-session
+	// reads from batched ones.
+	reviewCycles         map[domain.SessionID][]domain.ReviewCycle
+	listCyclesCalls      int
+	listCyclesBatchCalls int
 }
 
 func newFakeStore() *fakeStore {
@@ -542,6 +548,22 @@ func (f *fakeStore) ListPRFactsForSessions(_ context.Context, ids []domain.Sessi
 			continue
 		}
 		out[id] = []domain.PRFacts{}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ListOpenReviewCyclesBySession(_ context.Context, id domain.SessionID) ([]domain.ReviewCycle, error) {
+	f.listCyclesCalls++
+	return f.reviewCycles[id], nil
+}
+
+func (f *fakeStore) ListOpenReviewCyclesForSessions(_ context.Context, ids []domain.SessionID) (map[domain.SessionID][]domain.ReviewCycle, error) {
+	f.listCyclesBatchCalls++
+	out := make(map[domain.SessionID][]domain.ReviewCycle, len(ids))
+	for _, id := range ids {
+		if cycles := f.reviewCycles[id]; len(cycles) > 0 {
+			out[id] = cycles
+		}
 	}
 	return out, nil
 }
