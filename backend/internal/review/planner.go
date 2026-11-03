@@ -109,33 +109,71 @@ func latestCompletedRunForOtherSHA(runs []domain.ReviewRun, prURL, targetSHA str
 	return latest, found
 }
 
-// latestRunsByPRAndSHA picks the authoritative run per PR head: the newest
-// running pass while any reviewer is still working on that head, otherwise the
-// newest pass. Several reviewers may review one head at once, so a reviewer that
-// finished first must not hide one that is still running.
+// latestRunsByPRAndSHA picks the authoritative run per PR head (PRURL +
+// TargetSHA) when several reviewers may review the same head (#5465):
+//
+//  1. Each reviewer (Harness) is reduced to its own latest pass: a running pass
+//     first, otherwise the newest by CreatedAt. A reviewer's rerun supersedes
+//     only that reviewer's earlier verdict. Runs with an empty Harness (legacy)
+//     form their own bucket.
+//  2. Across those per-reviewer passes the authoritative run is chosen by
+//     precedence: running > changes_requested > newest CreatedAt. So a reviewer
+//     that finished first never hides one still running, and another
+//     reviewer's approval never hides a rejection on the same head.
+//
+// Ties on CreatedAt break by the greater ID so the choice never depends on
+// input or map iteration order.
 func latestRunsByPRAndSHA(runs []domain.ReviewRun) map[string]domain.ReviewRun {
-	latest := make(map[string]domain.ReviewRun)
+	perReviewer := make(map[string]domain.ReviewRun)
 	for _, run := range runs {
 		if run.PRURL == "" || run.TargetSHA == "" {
 			continue
 		}
+		key := run.PRURL + "\x00" + run.TargetSHA + "\x00" + string(run.Harness)
+		if existing, ok := perReviewer[key]; !ok || supersedesPass(run, existing) {
+			perReviewer[key] = run
+		}
+	}
+	latest := make(map[string]domain.ReviewRun)
+	for _, run := range perReviewer {
 		key := run.PRURL + "\x00" + run.TargetSHA
-		existing, ok := latest[key]
-		if !ok {
-			latest[key] = run
-			continue
-		}
-		runRunning := run.Status == domain.ReviewRunRunning
-		existingRunning := existing.Status == domain.ReviewRunRunning
-		if runRunning != existingRunning {
-			if runRunning {
-				latest[key] = run
-			}
-			continue
-		}
-		if run.CreatedAt.After(existing.CreatedAt) {
+		if existing, ok := latest[key]; !ok || outranksAcrossReviewers(run, existing) {
 			latest[key] = run
 		}
 	}
 	return latest
+}
+
+// supersedesPass reports whether run replaces existing as one reviewer's latest
+// pass on a head: running first, then newest CreatedAt, then greater ID.
+func supersedesPass(run, existing domain.ReviewRun) bool {
+	if r, e := isRunning(run), isRunning(existing); r != e {
+		return r
+	}
+	return newerRun(run, existing)
+}
+
+// outranksAcrossReviewers reports whether run replaces existing as the head's
+// authoritative run: running > changes_requested > newest CreatedAt > greater ID.
+func outranksAcrossReviewers(run, existing domain.ReviewRun) bool {
+	if r, e := isRunning(run), isRunning(existing); r != e {
+		return r
+	}
+	if r, e := requestsChanges(run), requestsChanges(existing); r != e {
+		return r
+	}
+	return newerRun(run, existing)
+}
+
+func isRunning(run domain.ReviewRun) bool { return run.Status == domain.ReviewRunRunning }
+
+func requestsChanges(run domain.ReviewRun) bool {
+	return !isRunning(run) && run.Verdict == domain.VerdictChangesRequested
+}
+
+func newerRun(run, existing domain.ReviewRun) bool {
+	if !run.CreatedAt.Equal(existing.CreatedAt) {
+		return run.CreatedAt.After(existing.CreatedAt)
+	}
+	return run.ID > existing.ID
 }

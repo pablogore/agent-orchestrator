@@ -3383,3 +3383,30 @@ func TestFailedReviewLaunchKeepsArchivedReviewerHidden(t *testing.T) {
 		})
 	}
 }
+
+func TestListReportsRejectionDespiteLaterApproval(t *testing.T) {
+	// #5465: GET /api/v1/sessions/{id}/reviews must not let reviewer B's later
+	// approval hide reviewer A's rejection on the same head.
+	const pr = "https://github.com/o/r/pull/1"
+	store := &fakeStore{
+		review: &domain.Review{ID: "rev-1", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-mer-1", ReviewerActivityState: domain.ActivityIdle},
+		runs: []domain.ReviewRun{
+			{ID: "run-a", SessionID: "mer-1", Harness: domain.ReviewerCodex, PRURL: pr, TargetSHA: "sha1", Status: domain.ReviewRunComplete, Verdict: domain.VerdictChangesRequested, CreatedAt: time.Unix(1, 0).UTC()},
+			{ID: "run-b", SessionID: "mer-1", Harness: domain.ReviewerClaudeCode, PRURL: pr, TargetSHA: "sha1", Status: domain.ReviewRunComplete, Verdict: domain.VerdictApproved, CreatedAt: time.Unix(2, 0).UTC()},
+		},
+	}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, &fakeLauncher{})
+	got, err := eng.List(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got.Reviews) != 1 {
+		t.Fatalf("reviews = %+v, want 1", got.Reviews)
+	}
+	if got.Reviews[0].Status != ReviewStateChangesRequested {
+		t.Fatalf("status = %s, want %s", got.Reviews[0].Status, ReviewStateChangesRequested)
+	}
+	if got.Reviews[0].LatestRun == nil || got.Reviews[0].LatestRun.ID != "run-a" {
+		t.Fatalf("latestRun = %+v, want run-a", got.Reviews[0].LatestRun)
+	}
+}
