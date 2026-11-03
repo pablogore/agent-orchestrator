@@ -756,3 +756,134 @@ func TestProjectRemove_YesSkipsConfirmationAndSupportsBackendRemoveEnvelope(t *t
 		t.Fatalf("--yes output should skip prompt and print removal:\n%s", out)
 	}
 }
+
+// TestBuildProjectConfigStrictConfigJSON covers #6169: --config-json is a full
+// replacement, so a key the CLI would silently drop (a typo, here or nested)
+// must fail before anything reaches the daemon instead of wiping the config.
+func TestBuildProjectConfigStrictConfigJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{name: "typo-only object", input: `{"typoOnly":true}`, wantErr: `"typoOnly"`},
+		{name: "unknown key next to valid ones", input: `{"sessionPrefix":"x","sesionPrefix":"y"}`, wantErr: `"sesionPrefix"`},
+		{name: "unknown nested key", input: `{"worker":{"agentConfig":{"modle":"m"}}}`, wantErr: `"modle"`},
+		{name: "unknown key in a reviewer", input: `{"reviewers":[{"harness":"claude-code","harnes":"x"}]}`, wantErr: `"harnes"`},
+		{name: "trailing object", input: `{} {}`, wantErr: "data after the JSON object"},
+		{name: "trailing garbage", input: `{"sessionPrefix":"x"} trailing`, wantErr: "data after the JSON object"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := buildProjectConfig(projectSetConfigOptions{configJSON: tt.input}, func(string) bool { return false }, func() (projectConfig, error) {
+				t.Fatal("--config-json must not read the current config")
+				return projectConfig{}, nil
+			})
+			if err == nil {
+				t.Fatalf("buildProjectConfig(%s) succeeded, want an error naming %s", tt.input, tt.wantErr)
+			}
+			if got := ExitCode(err); got != 2 {
+				t.Fatalf("exit code = %d (err %v), want 2 (usage error)", got, err)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want it to contain %s", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestBuildProjectConfigAcceptsFullyPopulatedConfig guards the other side of
+// strict decoding: every key the daemon accepts must still decode. The input is
+// generated from domain.ProjectConfig with every field set, so a new domain
+// field is covered without editing this test.
+func TestBuildProjectConfigAcceptsFullyPopulatedConfig(t *testing.T) {
+	var want domain.ProjectConfig
+	fillEveryField(t, reflect.ValueOf(&want).Elem())
+	input, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Whitespace after the object is not trailing data.
+	got, err := buildProjectConfig(projectSetConfigOptions{configJSON: string(input) + "\n"}, func(string) bool { return false }, nil)
+	if err != nil {
+		t.Fatalf("fully populated config rejected: %v\ninput=%s", err, input)
+	}
+	sent, err := json.Marshal(setConfigRequest{Config: got})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip struct {
+		Config domain.ProjectConfig `json:"config"`
+	}
+	if err := json.Unmarshal(sent, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(roundTrip.Config, want) {
+		t.Fatalf("round-trip changed the config\n got %+v\nwant %+v", roundTrip.Config, want)
+	}
+}
+
+// fillEveryField sets every exported, JSON-encoded field reachable from v to a
+// non-zero value, so omitempty encodes all of them. json:"-" fields (such as
+// AgentConfig.Launch) never travel in a config and stay zero.
+func fillEveryField(t *testing.T, v reflect.Value) {
+	t.Helper()
+	switch v.Kind() {
+	case reflect.String:
+		v.SetString("x")
+	case reflect.Bool:
+		v.SetBool(true)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v.SetInt(1)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		v.SetUint(1)
+	case reflect.Float32, reflect.Float64:
+		v.SetFloat(1)
+	case reflect.Pointer:
+		v.Set(reflect.New(v.Type().Elem()))
+		fillEveryField(t, v.Elem())
+	case reflect.Slice:
+		v.Set(reflect.MakeSlice(v.Type(), 1, 1))
+		fillEveryField(t, v.Index(0))
+	case reflect.Map:
+		key := reflect.New(v.Type().Key()).Elem()
+		fillEveryField(t, key)
+		elem := reflect.New(v.Type().Elem()).Elem()
+		fillEveryField(t, elem)
+		v.Set(reflect.MakeMap(v.Type()))
+		v.SetMapIndex(key, elem)
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if field := v.Type().Field(i); field.IsExported() && field.Tag.Get("json") != "-" {
+				fillEveryField(t, v.Field(i))
+			}
+		}
+	default:
+		t.Fatalf("fillEveryField: unsupported kind %s (%s); extend the helper", v.Kind(), v.Type())
+	}
+}
+
+// TestProjectSetConfig_ConfigJSONUnknownKeySendsNothing is the #6169 command
+// path: a typo-only --config-json used to become {} and replace the saved
+// config. It must fail as a usage error with no request to the daemon.
+func TestProjectSetConfig_ConfigJSONUnknownKeySendsNothing(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := projectConfigServer(t, `{"status":"ok","project":{"id":"demo","config":`+storedProjectConfig+`}}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, _, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "set-config", "demo", "--config-json", `{"typoOnly":true}`)
+	if got := ExitCode(err); got != 2 {
+		t.Fatalf("exit code = %d (err %v), want 2", got, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), `"typoOnly"`) {
+		t.Fatalf("error = %v, want it to name \"typoOnly\"", err)
+	}
+	if len(capture.requests) != 0 {
+		t.Fatalf("requests = %q, want none; a rejected --config-json must not replace the config", capture.requests)
+	}
+	if capture.putBody != nil {
+		t.Fatalf("PUT body = %s, want no config replacement", capture.putBody)
+	}
+}

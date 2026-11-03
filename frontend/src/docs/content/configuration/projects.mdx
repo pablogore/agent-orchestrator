@@ -161,7 +161,7 @@ Focused `ao project set-config` flags change only the fields they name; the rest
 ao project get <project-id> --json
 ```
 
-The `--config-json` flag takes a JSON string, not a filename. The CLI silently ignores unknown keys, so a typo can replace the configuration with an empty object. The daemon API rejects unknown fields.
+The `--config-json` flag takes a JSON string, not a filename. Like the daemon API, the CLI rejects unknown keys at any level, and data after the JSON object, before it sends anything, so a typo fails with an error that names the key instead of replacing the configuration.
 
 For full-config CLI updates, include every field you want to keep and inspect the result afterward.
 

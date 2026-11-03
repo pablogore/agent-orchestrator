@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"slices"
 	"sort"
@@ -309,7 +310,8 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 			"Field flags change only the fields they name and keep the rest of the saved config; " +
 			"a repeatable flag replaces that whole list or map. Field flags refuse a degraded " +
 			"project, whose config cannot be read; use --config-json to replace its config. " +
-			"--config-json replaces the whole config with the given object, and --clear removes all config.",
+			"--config-json replaces the whole config with the given object and rejects unknown keys, " +
+			"and --clear removes all config.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return usageError{err}
@@ -376,7 +378,7 @@ var projectConfigFlags = []string{
 
 // buildProjectConfig turns the set-config flags into the typed config sent to
 // the daemon. --clear empties the config; --config-json supplies the whole
-// object; otherwise each changed field flag overwrites its field in the current
+// object and must hold only known keys; otherwise each changed field flag overwrites its field in the current
 // config, so fields the CLI has no flag for (effort, ...) survive.
 // The daemon validates the values.
 func buildProjectConfig(opts projectSetConfigOptions, changed func(name string) bool, current func() (projectConfig, error)) (projectConfig, error) {
@@ -384,9 +386,9 @@ func buildProjectConfig(opts projectSetConfigOptions, changed func(name string) 
 		return projectConfig{}, nil
 	}
 	if opts.configJSON != "" {
-		var cfg projectConfig
-		if err := json.Unmarshal([]byte(opts.configJSON), &cfg); err != nil {
-			return projectConfig{}, usageError{fmt.Errorf("--config-json is not a valid JSON object: %w", err)}
+		cfg, err := decodeConfigJSON(opts.configJSON)
+		if err != nil {
+			return projectConfig{}, usageError{err}
 		}
 		return cfg, nil
 	}
@@ -437,6 +439,26 @@ func buildProjectConfig(opts projectSetConfigOptions, changed func(name string) 
 	}
 	if changed("reviewer") {
 		cfg.Reviewers = reviewersForFlags(opts.reviewers)
+	}
+	return cfg, nil
+}
+
+// decodeConfigJSON decodes --config-json as strictly as the daemon's config
+// API does. The object replaces the whole saved config, so an unknown key (at
+// any depth) or trailing data is an error rather than being dropped: a typo
+// like {"typoOnly":true} would otherwise decode to {} and wipe the config
+// (#6169). The CLI mirror carries every domain key
+// (TestProjectConfigMirrorsDomainJSONKeys), so nothing the daemon accepts is
+// rejected here.
+func decodeConfigJSON(raw string) (projectConfig, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var cfg projectConfig
+	if err := dec.Decode(&cfg); err != nil {
+		return projectConfig{}, fmt.Errorf("--config-json is not a valid project config: %w", err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return projectConfig{}, errors.New("--config-json has data after the JSON object; pass exactly one object")
 	}
 	return cfg, nil
 }

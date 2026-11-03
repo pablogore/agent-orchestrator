@@ -128,7 +128,7 @@ ao project rm agent-orchestrator -y
 
 Update a project's saved configuration. AO reads these settings when it spawns a session. Flags change only the fields they name and keep the rest of the saved config; a repeatable flag replaces that whole list or map. `--config-json` replaces the full object, and `--clear` removes all configuration.
 
-**Warning:** `--config-json` replaces the whole config. The CLI silently ignores unknown keys in it, so a typo can leave the replacement empty. See the [full-config warning](https://docs.orchestrator.inc/configuration/projects/#update-from-the-cli) before updating project settings from the CLI.
+**Warning:** `--config-json` replaces the whole config, so include every setting you want to keep. It rejects unknown keys (at any depth) and trailing data before sending anything, so a typo fails with an error naming the key. See the [full-config warning](https://docs.orchestrator.inc/configuration/projects/#update-from-the-cli) before updating project settings from the CLI.
 
 **Syntax:**
 ```
